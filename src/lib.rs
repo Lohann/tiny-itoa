@@ -4,31 +4,34 @@
 // Implementation of itoa (integer to ASCII), which converts an 64-bit to
 // decimal string. This implementation focus on smaller code footprint instead
 // raw performance, no lookup tables or caching, ideal for no_std environments
-// like wasm32-unknown-unknown or embeeded.
+// like wasm32-unknown-unknown and embeeded.
 //
 // @author Lohann Paterno Coutinho Ferreira <developer@lohann.dev>
 #![cfg_attr(not(test), no_std)]
 
-use ::core::{ptr::NonNull, num::NonZeroU8};
+use ::core::{num::NonZeroU8, ptr::NonNull, result::Result, str};
 
-/// Writes the decimal represetation of an an 64-bit unsigned integer to decimal
-/// to buffer.
+/// Writes the decimal represetation of an an 64-bit unsigned integer to
+/// decimal to buffer. Returns a pointer to the start of the string.
 ///
 /// # SAFETY
-/// caller must guarantee `end` is the end of the buffer, and it has sufficient
-/// space to convert the string..
+///
+/// caller must guarantee `end` points to end of the buffer and is has
+/// sufficient space to store `x` decimal digits.
 #[inline]
 #[must_use]
-pub const unsafe fn itoa_unchecked(mut x: u64, end: NonNull<u8>) -> usize {
+pub const unsafe fn itoa_unchecked(mut x: u64, end: NonNull<u8>) -> NonNull<u8> {
     // write digit by digit to buffer.
-	let mut ptr = end;
+    let mut ptr = end;
     loop {
         unsafe {
             ptr = ptr.sub(1);
             ptr.write(b'0'.wrapping_add((x % 10) as u8));
         };
         x = x.div_euclid(10);
-        if x == 0 { return unsafe { end.byte_offset_from_unsigned(ptr) }; }
+        if x == 0 {
+            break ptr;
+        }
     }
 }
 
@@ -44,14 +47,14 @@ const fn decimal_digits(mut x: u64) -> NonZeroU8 {
     const C3: u64 = 0b111_00000000000000000 - 1000; // 916504
     const C4: u64 = 0b100_00000000000000000 - 10000; // 514288
 
-    let mut digits = 1u8;
+    let mut digits = NonZeroU8::MIN;
     if x >= 10_000_000_000 {
-        x /= 10_000_000_000;
-        digits += 10u8;
+        x = x.div_euclid(10_000_000_000);
+        digits = digits.saturating_add(10u8);
     }
     if x >= 100_000 {
-        x /= 100_000;
-        digits += 5u8;
+        x = x.div_euclid(100_000);
+        digits = digits.saturating_add(5u8);
     }
     // Value of top bits:
     //                +c1  +c2  1&2  +c3  +c4  3&4   ^
@@ -61,124 +64,99 @@ const fn decimal_digits(mut x: u64) -> NonZeroU8 {
     //   1000..=9999  011  100  000  111  011  011  011 = 3
     // 10000..=99999  011  100  000  111  100  100  100 = 4
     x = (((x + C1) & (x + C2)) ^ ((x + C3) & (x + C4))) >> 17;
-    digits += (x & 0b0111) as u8;
-    unsafe { NonZeroU8::new_unchecked(digits) }
+    digits.saturating_add((x & 0b0111) as u8)
 }
 
-
-/// Compute min(x, y) without branching
-/// ref: <https://graphics.stanford.edu/~seander/bithacks.html#IntegerMinOrMax>
+/// Shrinks a mutable slice to the minimum between `slice.len()` and `max_len`.
 #[inline]
 #[must_use]
-const fn branchless_min(mut x: usize, mut y: usize) -> (usize, usize) {
-    x = x.wrapping_sub(y);
-    let mask = x.cast_signed().wrapping_shr(isize::BITS - 1).cast_unsigned();
-    x &= mask;
-    y = y.wrapping_add(x);
-    (mask, y)
+const fn shrink_to<T>(slice: &mut [T], max_len: usize) -> &mut [T] {
+    // Rust borrow checker doesn’t understand disjoint in slices, shrink it in
+    // a const fn needs unsafe code.
+    // Referece: <https://doc.rust-lang.org/nomicon/borrow-splitting.html>
+    if max_len <= slice.len() {
+        // SAFETY: `[ptr; mid]` and `[mid; len]` are inside `slice`, which
+        // fulfills the requirements of `split_at_unchecked`.
+        unsafe { slice.split_at_mut_unchecked(max_len).0 }
+    } else {
+        slice
+    }
 }
 
-/// base implementation which verifies output bondaries.
+/// Writes the decimal represetation of an 64-bit unsigned integer to the
+/// output buffer, returns the decimal string slice on success.
 ///
-/// # SAFETY
-/// caller must guarantee `ptr` is valid address and have up to `len` in size.
+/// # Errors
+///
+/// Returns `Err` when the decimal string doesn't fit inside the output buffer.
+/// The returned `Err` provides the total number of bytes (or digits) required.
+/// On failure the first `out.len()` decimal digits are written to the output
+/// buffer.
+/// 
+/// # Examples
+/// 
+/// ```
+/// use tiny_itoa::itoa;
+/// 
+/// let mut buffer = [0u8; 20];
+/// let n: &mut str = itoa(123_456_678, &mut buffer).unwrap();
+/// println!("n: {n}"); // output: 12345678
+/// ```
 #[inline]
-#[must_use]
 #[allow(clippy::cast_possible_truncation)]
-pub const unsafe fn itoa_raw(mut x: u64, ptr: *mut u8, len: usize) -> isize {
+pub const fn itoa(mut x: u64, out: &mut [u8]) -> Result<&mut str, NonZeroU8> {
     // Compute the number of decimal digits of `x`
     let digits = decimal_digits(x);
 
-    // find where the fist digit starts by computing:
-    let (mut mask, mut len) = branchless_min(len, digits.get() as usize);
-    let end: *mut u8 = unsafe { ptr.add(len) };
-    len = (len ^ mask).wrapping_sub(mask);
-    let mut digits = (digits.get() as usize ^ mask).wrapping_sub(mask);
+    // Shrinks the output buffer so it have at maximum `digits` in length, we
+    // need to know where it ends because digits are written in inverse order.
+    let out = shrink_to(out, digits.get() as usize);
 
-    {
-        let mut mask = unsafe { ptr.byte_offset_from(::core::ptr::null::<u8>()).cast_unsigned() };
-        mask = mask.wrapping_sub(1);
-        mask |= unsafe { end.byte_offset_from(::core::ptr::null::<u8>()).cast_unsigned() };
-        mask = !(mask.cast_signed().wrapping_shr(isize::BITS - 1).cast_unsigned());
-        digits &= mask;
-        len &= mask;
-    }
-    
-    if len == 0 { return digits.cast_signed(); }
+    // Return the number of digits as `Result::Err` when `out.is_empty()`
+    let Some(mut len) = NonZeroU8::new(out.len() as u8) else {
+        return Result::Err(digits);
+    };
 
-    // skip least significant digits when `len < digits`
-    mask |= 1;
-    while len != digits {
+    // Truncate last digits when `out.len() < digits`.
+    while len.get() < digits.get() {
         x = x.div_euclid(10);
-        len = len.wrapping_add(mask);
+        len = len.saturating_add(1);
     }
-    let _ = unsafe { itoa_unchecked(x, NonNull::new_unchecked(end)) };
-    digits.cast_signed()
-}
 
-#[must_use]
-pub const fn itoa(x: u64, output: &mut [u8]) -> isize {
-	// SAFETY: Rust guarantees output ptr and len are valid.
-	unsafe {
-		itoa_raw(x, output.as_mut_ptr(), output.len())
-	}
+    // SAFETY: We guaranteed that `out.len() > 0` and all digits fits inside
+    // the buffer.
+    let _ = unsafe {
+        let end = out.as_mut_ptr().add(out.len());
+        itoa_unchecked(x, NonNull::new_unchecked(end))
+    };
+
+    if out.len() >= digits.get() as usize {
+        // SAFETY: The `itoa_unchecked` only writes valid utf8 decimal digits.
+        let string = unsafe { str::from_utf8_unchecked_mut(out) };
+        Result::Ok(string)
+    } else {
+        Result::Err(digits)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
-    use super::{itoa, itoa_raw, branchless_min};
+    use super::itoa;
     use ::core::ffi::CStr;
 
     #[test]
-    fn branchless_min_works() {
-        for x in 0..=255usize {
-            for y in 0..=255usize {
-                let mask = if x < y { usize::MAX} else { 0 };
-                assert_eq!(branchless_min(x, y), (mask, usize::min(x, y)));
-            }
-        }
-    }
-
-    #[test]
-    fn itoa_raw_works() {
-        let test_cases = [0u64, 1u64, 123_456_789, u64::MAX];
-        let mut buffer = [0u8; 22];
-        for value in test_cases {
-            let expected = format!("{value}");
-            let slice = expected.as_str();
-            let str_len = slice.len();
-            for i in 0..buffer.len() {
-                buffer.fill(0);
-                let Some(buf) = buffer.get_mut(0..i) else {
-                    break;
-                };
-                let buf_len = buf.len();
-                let expected_len = usize::min(str_len, buf_len);
-                let decimal = unsafe {
-                    let ptr = buf.as_mut_ptr();
-                    let mut str_len = str_len.cast_signed();
-                    if buf_len < str_len.cast_unsigned() {
-                        str_len = -str_len;
-                    }
-                    assert_eq!(itoa_raw(value, ptr, buf_len), str_len);
-                    let res = itoa_raw(value, ptr, buf_len);
-                    assert_eq!(res, str_len, "itoa_raw({value}, {buf_len}) | {res} != {str_len}");
-                    CStr::from_bytes_until_nul(&buffer[0..]).unwrap().to_str().unwrap()
-                };
-                assert_eq!(decimal, &slice[0..expected_len as usize]);
-            }
-        }
-    }
-
-	#[test]
     fn itoa_works() {
         let test_cases = [0u64, 1u64, 123_456_789, u64::MAX];
         let mut buffer = [0u8; 22];
+
+        // Run for each number
         for value in test_cases {
             let expected = format!("{value}");
             let slice = expected.as_str();
             let str_len = slice.len();
+
+            // Try different output buffer sizes
             for i in 0..buffer.len() {
                 buffer.fill(0);
                 let Some(buf) = buffer.get_mut(0..i) else {
@@ -186,15 +164,22 @@ mod tests {
                 };
                 let buf_len = buf.len();
                 let expected_len = usize::min(str_len, buf_len);
-                {
-                    let mut str_len = str_len.cast_signed();
-                    if buf_len < str_len.cast_unsigned() {
-                        str_len = -str_len;
+                let decimal = {
+                    match itoa(value, buf) {
+                        Ok(s) => {
+                            assert_eq!(s, slice);
+                            assert!(buf_len >= str_len);
+                        }
+                        Err(len) => {
+                            assert_eq!(len.get() as usize, str_len);
+                            assert!(buf_len < str_len);
+                        }
                     }
-                    let res = itoa(value, buf);
-                    assert_eq!(res, str_len, "itoa({value}, {buf_len}) | {res} != {str_len}");
-                }
-                let decimal = CStr::from_bytes_until_nul(&buffer[0..]).unwrap().to_str().unwrap();
+                    CStr::from_bytes_until_nul(&buffer[0..])
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                };
                 assert_eq!(decimal, &slice[0..expected_len as usize]);
             }
         }
