@@ -1,12 +1,18 @@
 [package]
 name = "tiny-itoa"
-description = "no_std implementation of integer to decimal string"
+version = "0.3.0"
+authors = ["Lohann Paterno Coutinho Ferreira <developer@lohann.dev>"]
+categories = ["value-formatting", "no-std", "no-std::no-alloc"]
+description = "no_std integer primitive to decimal string conversion"
+documentation = "https://docs.rs/tiny-itoa"
+edition = "2018"
 license = "MIT"
-version = "0.2.0"
-edition = "2021"
 readme = "README.md"
 repository = "https://github.com/Lohann/tiny-itoa.git"
 homepage = "https://github.com/Lohann/tiny-itoa"
-authors = ["Lohann Paterno Coutinho Ferreira <developer@lohann.dev>"]
+
+rust-version = "1.60"
 
 [dependencies]
+const_fn = { version = "0.4.12" }
+rustversion = { version = "1.0.22" }
