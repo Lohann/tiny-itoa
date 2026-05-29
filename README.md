@@ -1,6 +1,6 @@
 ## tiny-itoa
 
-A zero-allocation, minimal, panic free integer to decimal implementation.
+A zero-allocation, minimal, panic free integer primitive to decimal string conversion.
 
 ### Features
 - `no_std`/WASM compatible.
